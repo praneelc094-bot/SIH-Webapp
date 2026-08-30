@@ -1,15 +1,30 @@
 # MediKiosk
 
-AI Clinical History Software Platform — backend for an AI-assisted clinical history intake kiosk.
+AI-assisted clinical history intake platform for collecting patient information,
+reading medical documents, asking safe follow-up questions, and preparing a
+doctor-reviewable summary.
 
 Full architecture rules, tech stack, and the clinical data contracts live in [`claude.md.md`](claude.md.md) — read that first.
 
-## Tech Stack
-- **Backend:** Python 3.10+, FastAPI, Pydantic v2
-- **AI/ML:** Local Qwen2.5-1.5B-Instruct LoRA adapter for bilingual intake; OpenAI-compatible API for document/history extraction
-- **Database & Storage:** Supabase (PostgreSQL & Storage)
+## Technology and models
 
-This repository currently provides the backend API; there is no web frontend in this checkout.
+- **Backend:** Python, FastAPI, Uvicorn, Pydantic v2
+- **Conversation model:** Qwen/Qwen2.5-1.5B-Instruct, loaded locally for
+  question generation using ChatML formatting
+- **Fine-tuning:** Optional LoRA adapter trained from the clinical question
+  workbooks; the base Qwen model is used by default for dynamic transcripts
+- **Document understanding:** OpenAI-compatible structured-output and vision
+  API, configurable for OpenAI or xAI/Grok
+- **Speech recognition:** Local `faster-whisper`, OpenAI transcription, or
+  configurable Bhashini ASR
+- **Speech synthesis:** Local `pyttsx3`, OpenAI TTS, or configurable Bhashini
+  TTS
+- **Database and storage:** Supabase PostgreSQL and Supabase Storage
+- **Frontend handoff:** Three independent frontend workstreams are documented
+  in [`FRONTEND_README.md`](FRONTEND_README.md)
+
+The backend is device-independent: web and mobile frontends call these APIs;
+the local AI models run on the backend machine.
 
 ## Getting Started
 
@@ -39,7 +54,19 @@ This repository currently provides the backend API; there is no web frontend in 
    - `OPENAI_API_KEY` — from OpenAI, or set `AI_PROVIDER=xai` and `GROK_API_KEY` for xAI
    - `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` — from the shared Supabase project (ask a teammate for access, or see below). The backend requires the **service_role** key, not the anon key — patient data is locked down to service_role-only access (see `supabase_schema.sql`). Never share this key outside the team or commit it.
 
-5. **Run the API**
+5. **Choose a voice provider**
+
+   For API-key-free local voice:
+
+   ```env
+   VOICE_PROVIDER=local
+   LOCAL_WHISPER_MODEL=small
+   LOCAL_WHISPER_DEVICE=auto
+   ```
+
+   OpenAI and Bhashini settings are also available in `.env.example`.
+
+6. **Run the API**
    ```powershell
    python -m uvicorn main:app --host 127.0.0.1 --port 8000
    ```
@@ -51,17 +78,44 @@ This repository currently provides the backend API; there is no web frontend in 
    `grok-4.6`) in `.env`. Both providers use the same
    OpenAI-compatible client; no API key is committed to the repository.
 
-   The `/ask-clinical-question` endpoint uses the local bilingual Qwen adapter
-   from `training/outputs/qwen2.5-1.5b-bilingual-lora/` and does not require an
-   API key. The adapter is loaded lazily on its first request.
+   The local question endpoint loads Qwen lazily on its first request. The
+   base model does not require an external AI API key, but its model weights
+   must be available.
+
+## Application workflow
+
+1. Patient logs in with a patient ID.
+2. The app loads saved allergies, medicines, conditions, and previous reports.
+3. The app asks whether previous history exists before deeper questioning.
+4. The patient uploads a prescription/report and describes the problem by text
+   or voice.
+5. The AI asks one focused follow-up question at a time in English, Hindi, or
+   Hinglish.
+6. The app sends the complete transcript and extracted documents to
+   `/generate-summary`.
+7. The summary is saved to Supabase and appears in the doctor's waiting room.
+8. The doctor reviews, edits, and adds diagnosis/treatment information.
 
 ## API usage
 
 Open Swagger UI at `http://127.0.0.1:8000/docs`.
 
 - `POST /extract-history` — body `{"transcript": "..."}`, extracts structured clinical history from a text transcript.
-- `POST /ask-clinical-question` — body `{"transcript": "..."}`, uses the local Qwen adapter to ask one safe follow-up question in English, Hindi, or Romanized Hinglish. It does not prescribe medicine.
+- `POST /ask-clinical-question` — uses local Qwen to ask one safe follow-up question.
 - `POST /extract-from-image` — multipart file upload, extracts structured clinical history from a prescription/document image (uploaded to Supabase Storage first, then read by the OpenAI Vision model).
+- `POST /converse` — maintains an adaptive one-question-at-a-time interview.
+- `POST /generate-summary` — combines transcript and document data into a saved doctor-reviewable summary.
+- `POST /voice/transcribe` — converts audio to text.
+- `POST /voice/patient-assistant` — converts patient audio and returns the next question.
+- `POST /voice/speak` — converts text to playable audio.
+- `POST /doctor/voice-note` — converts doctor dictation to text.
+- `POST /patient/profile` and `GET /patient/profile/{patient_id}` — save/load allergies and long-term context.
+- `POST /patient/report` and `GET /patient/reports/{patient_id}` — save/load previous reports.
+- `POST /patient/intake-start` — asks about previous history first.
+- `GET /api/v1/waiting-room` — doctor waiting room.
+- `GET /api/v1/priority-alerts` — unacknowledged urgent cases.
+- `PATCH /patient-histories/{history_id}` — doctor edits.
+- `POST /doctor/approved-case` — stores a doctor-reviewed learning case.
 - `GET /health` — liveness check.
 
 Example:
@@ -105,6 +159,28 @@ For a beginner-friendly, step-by-step explanation of the dataset, tokenizer,
 fine-tuning, LoRA adapter, training settings, inference flow, and limitations,
 see [`training/README.md`](training/README.md#how-the-model-was-trained-class-10-explanation).
 
+For the three-person frontend implementation plan, screen layouts, API
+contracts, voice integration, and end-to-end acceptance test, see
+[`FRONTEND_README.md`](FRONTEND_README.md).
+
+## Datasets and training
+
+The repository includes:
+
+- `trilingual_clinical_conversation_questions.xlsx` — English, Hindi, and
+  Hinglish question examples.
+- `bilingual_clinical_conversation_questions.xlsx` — earlier English/Hindi
+  workbook with generated Hinglish variants.
+- `training/dataset/*.jsonl` — prescription image/transcription splits and
+  curated doctor-approved examples.
+- `training/train_qwen_qlora.py` — LoRA fine-tuning script.
+- `training/build_doctor_case_dataset.py` — builds data only from
+  doctor-reviewed cases.
+
+Training is not performed automatically on every live patient interaction.
+Doctor approval and sanitization are required before cases enter a future
+training run.
+
 ## Database (Supabase)
 
 The database schema is defined in [`supabase_schema.sql`](supabase_schema.sql):
@@ -124,7 +200,8 @@ main.py                FastAPI app and API routes
 local_bilingual_model.py Lazy loader for the local Qwen bilingual adapter
 bilingual_clinical_conversation_questions.xlsx / trilingual_clinical_conversation_questions.xlsx Training question datasets
 training/               Dataset preparation, training scripts, adapters, and metrics
+frontend/README.md     Three-person frontend implementation and API integration guide
 supabase_schema.sql     Database schema, storage bucket, and RLS policies
-requirements.txt        Python dependencies
-.env.example            Required environment variables (copy to .env)
+requirements.txt       Python dependencies
+.env.example           Required environment variables (copy to .env)
 ```

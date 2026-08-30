@@ -29,6 +29,7 @@ import tempfile
 import uuid
 from datetime import datetime
 from pathlib import Path
+from threading import Lock
 from typing import List, Optional
 from urllib import request
 
@@ -124,6 +125,10 @@ class ConversationalQuestionResponse(BaseModel):
     language: str = Field(description="Detected language, such as Hindi, English, or Hinglish.")
     red_flags_detected: bool = Field(
         description="True when the patient's message suggests an urgent emergency symptom."
+    )
+    transcript: Optional[str] = Field(
+        default=None,
+        description="Recognized patient speech when the response came from a voice request.",
     )
 
 
@@ -374,7 +379,13 @@ def _load_local_whisper():
                     raise RuntimeError(
                         "Local voice requires faster-whisper. Install it with 'pip install faster-whisper'."
                     ) from exc
-                device = "cpu" if LOCAL_WHISPER_DEVICE == "auto" else LOCAL_WHISPER_DEVICE
+                device = (
+                    "cuda"
+                    if LOCAL_WHISPER_DEVICE == "auto" and torch.cuda.is_available()
+                    else LOCAL_WHISPER_DEVICE
+                )
+                if device == "auto":
+                    device = "cpu"
                 compute_type = "float16" if device == "cuda" else "int8"
                 _local_whisper = WhisperModel(
                     LOCAL_WHISPER_MODEL,
@@ -700,6 +711,28 @@ async def _synthesize_voice_text(text: str, language: str) -> VoiceSynthesisResu
     raise RuntimeError(f"Unsupported VOICE_PROVIDER: {VOICE_PROVIDER}. Set it to 'openai' or 'bhashini'.")
 
 
+async def _local_voice_assistant(file: UploadFile, language: str) -> ConversationalQuestionResponse:
+    transcription = await _transcribe_voice_upload(file, language)
+    text_for_model, detected_language = normalize_multilingual_voice_text(transcription.text, language)
+    try:
+        from local_bilingual_model import ask
+
+        reply = await asyncio.to_thread(ask, text_for_model)
+    except (FileNotFoundError, RuntimeError, OSError) as exc:
+        logger.exception("Local bilingual model inference failed for voice input.")
+        raise HTTPException(status_code=503, detail=f"Local bilingual model unavailable: {exc}") from exc
+    lower = text_for_model.lower()
+    hinglish = any(word in lower for word in ("mere", "pet", "dard", "hai", "hue", "kaise"))
+    hindi = any("\u0900" <= char <= "\u097f" for char in transcription.text)
+    urgent = any(word in lower for word in ("chest pain", "breathing", "faint", "stroke", "बेहोश", "सीने"))
+    return ConversationalQuestionResponse(
+        reply=reply,
+        language="Hinglish" if hinglish else ("Hindi" if hindi else ("Hindi" if detected_language.startswith("hi") else "English")),
+        red_flags_detected=urgent,
+        transcript=transcription.text,
+    )
+
+
 # Same fallback pattern for Supabase: allow the app to start before
 # SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are configured; real DB/Storage
 # calls will fail with a clear 502 until valid credentials are set in the
@@ -884,26 +917,13 @@ async def speak_text(text: str = "", language: str = "en") -> VoiceSynthesisResu
 @app.post("/voice/patient-assistant", response_model=ConversationalQuestionResponse)
 async def patient_voice_assistant(file: UploadFile = File(...), language: str = "en") -> ConversationalQuestionResponse:
     """Transcribe a spoken patient answer and return the next question to ask."""
-    transcription = await _transcribe_voice_upload(file, language)
-    text_for_model, text_language = normalize_multilingual_voice_text(transcription.text, language)
     try:
-        from local_bilingual_model import ask
-
-        reply = await asyncio.to_thread(ask, text_for_model)
-    except (FileNotFoundError, RuntimeError, OSError) as exc:
-        logger.exception("Local bilingual model inference failed for voice input.")
-        raise HTTPException(status_code=503, detail=f"Local bilingual model unavailable: {exc}") from exc
-
-    lower = text_for_model.lower()
-    hindi = any("\u0900" <= char <= "\u097f" for char in text_for_model)
-    hinglish = any(word in lower for word in ("mere", "pet", "dard", "hai", "hue", "kaise"))
-    urgent = any(word in lower for word in ("chest pain", "breathing", "faint", "stroke", "बेहोश", "सीने"))
-    language_name = "Hinglish" if hinglish else ("Hindi" if hindi else "English")
-    return ConversationalQuestionResponse(
-        reply=reply,
-        language=language_name,
-        red_flags_detected=urgent,
-    )
+        return await _local_voice_assistant(file, language)
+    except HTTPException:
+        raise
+    except (RuntimeError, ValueError, OSError) as exc:
+        logger.exception("Voice patient assistant failed.")
+        raise HTTPException(status_code=502, detail=f"Voice patient assistant failed: {exc}") from exc
 
 
 @app.post("/doctor/voice-note", response_model=VoiceTranscriptionResult)
